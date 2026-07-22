@@ -3,8 +3,8 @@
 **Phase:** 0 (Foundations) — design only.
 
 ## Done
-- Layered CAS + encryption + capability + history design drafted ([ARCHITECTURE.md](./ARCHITECTURE.md)).
-- Trade-offs and threat model documented.
+- Layered CAS + encryption + capability + history design drafted and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
+- Trade-offs and threat model documented and reviewed.
 
 ## Next
 - Decide the block store / object model details and GC strategy.
