@@ -1,0 +1,17 @@
+[package]
+name = "lantern-filesystem"
+version = "0.0.0"
+edition = "2021"
+description = "LanternOS content-addressed filesystem v0 — Phase 2 prototype (RFC-0009/ADR-0014)"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "lantern_filesystem"
+path = "src/lib.rs"
+
+[dependencies]
+lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
+lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }
+lantern-capabilities = { git = "https://github.com/lantern-os/lantern-capabilities", branch = "main" }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main" }

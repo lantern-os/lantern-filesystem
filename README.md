@@ -7,7 +7,7 @@ objects.
 - **Layer:** system service (confined user space).
 - **System context:** [wiki/Filesystem](https://github.com/lantern-os/lantern-docs/blob/main/wiki/Filesystem.md).
 
-> ⚠️ **Phase 0.** Design only; no code. See [`STATUS.md`](./STATUS.md).
+> ⚠️ **Phase 2.** Content-addressed store v0 prototype in progress. See [`STATUS.md`](./STATUS.md).
 
 ## In this repo
 - [`ARCHITECTURE.md`](./ARCHITECTURE.md), [`THREAT_MODEL.md`](./THREAT_MODEL.md), [`STATUS.md`](./STATUS.md).
