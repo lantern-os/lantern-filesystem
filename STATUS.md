@@ -58,6 +58,13 @@
   not-yet-built confined execution environment, same gap `lantern-capabilities`/
   `lantern-crypto` both document for `Broker`/`Keystore` — this crate's methods still take
   `&mut KernelState` directly, valid only for privileged, same-address-space code.
+  **Progress from the other side:** `lantern-runtime` now exposes a `lantern:host/filesystem`
+  WIT interface and the resource-scoped `file`-handle ⇄ badge mapping that reaches it
+  ([RFC-0016](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0016-filesystem-wit-interface.md)/[ADR-0019](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0019-filesystem-wit-interface.md),
+  `lantern-runtime/STATUS.md`) — shaped like `Store` (a `FileId` by handle, no paths), it
+  drives a *real* `Store` today via an in-process `InProcessFilesystem` stand-in. What's
+  still missing is exactly this crate's confined-IPC-service form, not the Wasm-guest-facing
+  surface.
 
 ## Blocked on
 - ~~Crypto keystore/AEAD ([`lantern-crypto`](https://github.com/lantern-os/lantern-crypto)).~~ Resolved — `Keystore`
