@@ -56,12 +56,11 @@
 //! directly, valid only for privileged, same-address-space code.
 #![cfg_attr(not(test), no_std)]
 
-use lantern_capabilities::Broker;
+use lantern_capabilities::{Broker, KernelBackend, SyscallError};
 use lantern_crypto::{Keystore, KeyId};
 use lantern_crypto::aead;
 use lantern_crypto::hash;
-use lantern_kernel::cap::{CPtr, Rights, TcbId};
-use lantern_kernel::error::SyscallError;
+use lantern_kernel::cap::{CPtr, TcbId};
 use lantern_kernel::state::KernelState;
 
 /// Fixed capacity, no heap — matches every other Phase 1/2 kernel-adjacent pool in
@@ -166,6 +165,11 @@ struct GrantRecord {
 /// establishes for key material.
 pub struct Store {
     broker: Broker,
+    /// This store's own thread identity — needed to build a [`KernelBackend`]
+    /// for the composed [`Broker`] on each mint/grant. (A fully confined store
+    /// would use `lantern_capabilities::Abi`; this crate still takes
+    /// `&mut KernelState` in its own public API.)
+    self_tcb: TcbId,
     /// This store's own access to its single v0 encryption key, in the composed
     /// [`lantern_crypto::Keystore`] — see [`Store::new`]'s precondition doc.
     aead_badge: u64,
@@ -186,7 +190,8 @@ impl Store {
     /// `Broker::new`'s own `self_cnode_cptr` doc already documents.
     pub fn new(self_tcb: TcbId, self_cnode_cptr: CPtr, aead_badge: u64, aead_key: KeyId) -> Self {
         Self {
-            broker: Broker::new(self_tcb, self_cnode_cptr),
+            broker: Broker::new(self_cnode_cptr),
+            self_tcb,
             aead_badge,
             aead_key,
             files: [const { None }; MAX_FILES],
@@ -238,19 +243,30 @@ impl Store {
             return Err(StoreError::FileDestroyed);
         }
         let slot = self.grants.iter().position(Option::is_none).ok_or(StoreError::NotEnoughCapacity)?;
-        let badge = self.broker.mint(state, source_slot, scratch_slot, Rights::READ.union(Rights::GRANT)).map_err(StoreError::Kernel)?;
+        let badge = self.broker
+            .mint(
+                &mut KernelBackend::new(state, self.self_tcb),
+                source_slot,
+                scratch_slot,
+                lantern_capabilities::Rights::READ.union(lantern_capabilities::Rights::GRANT),
+            )
+            .map_err(StoreError::Kernel)?;
         self.grants[slot] = Some(GrantRecord { badge, file, ops });
         Ok(badge)
     }
 
     /// Forwards to [`lantern_capabilities::Broker::grant`]; see its doc.
     pub fn deliver_grant(&self, state: &mut KernelState, endpoint_cptr: CPtr, scratch_slot: CPtr, payload: (usize, usize)) -> Result<(), StoreError> {
-        self.broker.grant(state, endpoint_cptr, scratch_slot, payload).map_err(StoreError::Kernel)
+        self.broker
+            .grant(&mut KernelBackend::new(state, self.self_tcb), endpoint_cptr, scratch_slot, payload)
+            .map_err(StoreError::Kernel)
     }
 
     /// Forwards to [`lantern_capabilities::Broker::grant_via_reply`]; see its doc.
     pub fn deliver_grant_via_reply(&self, state: &mut KernelState, scratch_slot: CPtr, payload: (usize, usize)) -> Result<(), StoreError> {
-        self.broker.grant_via_reply(state, scratch_slot, payload).map_err(StoreError::Kernel)
+        self.broker
+            .grant_via_reply(&mut KernelBackend::new(state, self.self_tcb), scratch_slot, payload)
+            .map_err(StoreError::Kernel)
     }
 
     /// Forwards to [`lantern_capabilities::Broker::revoke`]; see its doc.
@@ -366,7 +382,7 @@ mod tests {
     use super::*;
     use lantern_crypto::KeyOps;
     use lantern_hal::{MessageTag, TrapFrame};
-    use lantern_kernel::cap::{CNode, CNodeId, Capability, EndpointId, NotificationId};
+    use lantern_kernel::cap::{CNode, CNodeId, Capability, EndpointId, NotificationId, Rights};
     use lantern_kernel::ipc;
     use lantern_kernel::object::{Notification, Tcb};
 
