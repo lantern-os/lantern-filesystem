@@ -10,8 +10,17 @@ publish = false
 name = "lantern_filesystem"
 path = "src/lib.rs"
 
+[features]
+default = ["kernel-backend"]
+# The `&mut KernelState` broker backend — for host tests and for privileged,
+# same-address-space callers. A confined Store running via the `Abi` backend
+# needs none of this and can build with `default-features = false` (only
+# `lantern-abi`/`lantern-crypto` linked) — RFC-0019/ADR-0024.
+kernel-backend = ["dep:lantern-hal", "dep:lantern-kernel", "lantern-capabilities/kernel-backend", "lantern-crypto/kernel-backend"]
+
 [dependencies]
-lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main" }
-lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main" }
-lantern-capabilities = { git = "https://github.com/lantern-os/lantern-capabilities", branch = "main" }
-lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main" }
+lantern-abi = { git = "https://github.com/lantern-os/lantern-abi", branch = "main" }
+lantern-hal = { git = "https://github.com/lantern-os/lantern-hal", branch = "main", optional = true }
+lantern-kernel = { git = "https://github.com/lantern-os/lantern-kernel", branch = "main", optional = true }
+lantern-capabilities = { git = "https://github.com/lantern-os/lantern-capabilities", branch = "main", default-features = false }
+lantern-crypto = { git = "https://github.com/lantern-os/lantern-crypto", branch = "main", default-features = false }

@@ -50,18 +50,29 @@
 //!   is ordinary storage reclamation, not the confused-deputy risk `FileId` reuse
 //!   would be.
 //!
-//! **What this is not yet:** a real, standalone confined program — same caveat
-//! [`lantern_capabilities::Broker`]/[`lantern_crypto::Keystore`] both carry.
-//! [`Store::request_file_access`] takes `&mut lantern_kernel::state::KernelState`
-//! directly, valid only for privileged, same-address-space code.
+//! **Backend split** ([RFC-0018](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0018-confined-execution-port.md)/
+//! [ADR-0022](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0022-confined-service-model-and-call-transport.md),
+//! matching [`lantern_crypto::Keystore`]'s own): [`Store`]'s badge-granting
+//! methods (`request_file_access`/`deliver_grant`/`deliver_grant_via_reply`)
+//! take `&mut impl BrokerBackend` and forward to the composed
+//! [`lantern_capabilities::Broker`] — `Store` carries no `TcbId` of its own.
+//! `lantern-filesystem` built with `default-features = false` links only
+//! `lantern-abi`/`lantern-crypto` — nothing from the TCB.
+//!
+//! **Still same-address-space: [`Store::write`]/[`Store::read`] take
+//! `keystore: &lantern_crypto::Keystore` directly**, not yet a `Channel` to a
+//! separate confined `keystore-service` — unlike the badge-granting methods
+//! above, generalizing these needs `Store` to become an IPC *client* of
+//! `Keystore` (RFC-0019's `keystore` wire protocol on the *sending* side, not
+//! just the receiving side `lantern_crypto::wire::handle_request` already
+//! implements). Real, tracked follow-up work (`STATUS.md`), not done here.
 #![cfg_attr(not(test), no_std)]
 
-use lantern_capabilities::{Broker, KernelBackend, SyscallError};
+use lantern_abi::wire::CPtr;
+use lantern_capabilities::{Broker, BrokerBackend, SyscallError};
 use lantern_crypto::{Keystore, KeyId};
 use lantern_crypto::aead;
 use lantern_crypto::hash;
-use lantern_kernel::cap::{CPtr, TcbId};
-use lantern_kernel::state::KernelState;
 
 /// Fixed capacity, no heap — matches every other Phase 1/2 kernel-adjacent pool in
 /// this project ([`lantern_crypto::Keystore`]'s own convention).
@@ -165,11 +176,6 @@ struct GrantRecord {
 /// establishes for key material.
 pub struct Store {
     broker: Broker,
-    /// This store's own thread identity — needed to build a [`KernelBackend`]
-    /// for the composed [`Broker`] on each mint/grant. (A fully confined store
-    /// would use `lantern_capabilities::Abi`; this crate still takes
-    /// `&mut KernelState` in its own public API.)
-    self_tcb: TcbId,
     /// This store's own access to its single v0 encryption key, in the composed
     /// [`lantern_crypto::Keystore`] — see [`Store::new`]'s precondition doc.
     aead_badge: u64,
@@ -180,18 +186,19 @@ pub struct Store {
 }
 
 impl Store {
-    /// `self_tcb`/`self_cnode_cptr` — forwarded to
-    /// [`lantern_capabilities::Broker::new`]; see its doc. `aead_badge`/`aead_key`
-    /// — the caller (real store bootstrap code, or a test) is responsible for
+    /// `self_cnode_cptr` — forwarded to [`lantern_capabilities::Broker::new`];
+    /// see its doc. `Store` carries no `TcbId` of its own — every method that
+    /// needs one (the badge-granting methods below) takes a
+    /// `&mut impl BrokerBackend` instead. `aead_badge`/`aead_key` — the
+    /// caller (real store bootstrap code, or a test) is responsible for
     /// having already obtained these from the composed [`lantern_crypto::Keystore`]
     /// (`Keystore::generate_aead_key` then `request_key_access`+`deliver_grant`,
     /// with [`lantern_crypto::KeyOps::ENCRYPT`]/[`lantern_crypto::KeyOps::DECRYPT`]
     /// both granted) — the same "caller sets up the precondition" discipline
     /// `Broker::new`'s own `self_cnode_cptr` doc already documents.
-    pub fn new(self_tcb: TcbId, self_cnode_cptr: CPtr, aead_badge: u64, aead_key: KeyId) -> Self {
+    pub fn new(self_cnode_cptr: CPtr, aead_badge: u64, aead_key: KeyId) -> Self {
         Self {
             broker: Broker::new(self_cnode_cptr),
-            self_tcb,
             aead_badge,
             aead_key,
             files: [const { None }; MAX_FILES],
@@ -230,9 +237,14 @@ impl Store {
     /// `file` and `ops`. Two-step, same shape as
     /// [`lantern_crypto::Keystore::request_key_access`]/`deliver_grant` — call
     /// [`Store::deliver_grant`] (or [`Store::deliver_grant_via_reply`]) next.
+    ///
+    /// Mints with `Rights::WRITE | Rights::GRANT` — see
+    /// [`lantern_crypto::Keystore::request_key_access`]'s doc for why
+    /// `WRITE`, not `READ`: the granted capability is a badged copy of this
+    /// store's own endpoint, and a client only ever `Call`s it.
     pub fn request_file_access(
         &mut self,
-        state: &mut KernelState,
+        backend: &mut impl BrokerBackend,
         file: FileId,
         ops: FileOps,
         source_slot: CPtr,
@@ -245,10 +257,10 @@ impl Store {
         let slot = self.grants.iter().position(Option::is_none).ok_or(StoreError::NotEnoughCapacity)?;
         let badge = self.broker
             .mint(
-                &mut KernelBackend::new(state, self.self_tcb),
+                backend,
                 source_slot,
                 scratch_slot,
-                lantern_capabilities::Rights::READ.union(lantern_capabilities::Rights::GRANT),
+                lantern_capabilities::Rights::WRITE.union(lantern_capabilities::Rights::GRANT),
             )
             .map_err(StoreError::Kernel)?;
         self.grants[slot] = Some(GrantRecord { badge, file, ops });
@@ -256,17 +268,13 @@ impl Store {
     }
 
     /// Forwards to [`lantern_capabilities::Broker::grant`]; see its doc.
-    pub fn deliver_grant(&self, state: &mut KernelState, endpoint_cptr: CPtr, scratch_slot: CPtr, payload: (usize, usize)) -> Result<(), StoreError> {
-        self.broker
-            .grant(&mut KernelBackend::new(state, self.self_tcb), endpoint_cptr, scratch_slot, payload)
-            .map_err(StoreError::Kernel)
+    pub fn deliver_grant(&self, backend: &mut impl BrokerBackend, endpoint_cptr: CPtr, scratch_slot: CPtr, payload: (usize, usize)) -> Result<(), StoreError> {
+        self.broker.grant(backend, endpoint_cptr, scratch_slot, payload).map_err(StoreError::Kernel)
     }
 
     /// Forwards to [`lantern_capabilities::Broker::grant_via_reply`]; see its doc.
-    pub fn deliver_grant_via_reply(&self, state: &mut KernelState, scratch_slot: CPtr, payload: (usize, usize)) -> Result<(), StoreError> {
-        self.broker
-            .grant_via_reply(&mut KernelBackend::new(state, self.self_tcb), scratch_slot, payload)
-            .map_err(StoreError::Kernel)
+    pub fn deliver_grant_via_reply(&self, backend: &mut impl BrokerBackend, scratch_slot: CPtr, payload: (usize, usize)) -> Result<(), StoreError> {
+        self.broker.grant_via_reply(backend, scratch_slot, payload).map_err(StoreError::Kernel)
     }
 
     /// Forwards to [`lantern_capabilities::Broker::revoke`]; see its doc.
@@ -377,14 +385,16 @@ fn nonce_from_hash(h: &hash::Hash) -> [u8; aead::NONCE_LEN] {
     nonce
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "kernel-backend"))]
 mod tests {
     use super::*;
+    use lantern_capabilities::KernelBackend;
     use lantern_crypto::KeyOps;
     use lantern_hal::{MessageTag, TrapFrame};
-    use lantern_kernel::cap::{CNode, CNodeId, Capability, EndpointId, NotificationId, Rights};
+    use lantern_kernel::cap::{CNode, CNodeId, Capability, EndpointId, NotificationId, Rights, TcbId};
     use lantern_kernel::ipc;
     use lantern_kernel::object::{Notification, Tcb};
+    use lantern_kernel::state::KernelState;
 
     const SOURCE_SLOT: CPtr = 5;
     const SCRATCH_SLOT: CPtr = 6;
@@ -422,28 +432,34 @@ mod tests {
         // The crypto-service thread: owns the store's one v0 AEAD key.
         let (keystore_cnode, keystore_tcb) = new_cnode_and_tcb(&mut state);
         let notif_idx = state.notifications.alloc(Notification::new()).unwrap();
-        let source = Capability::Notification { id: NotificationId(notif_idx as u16), badge: 0, rights: Rights::READ.union(Rights::GRANT) };
+        let source = Capability::Notification { id: NotificationId(notif_idx as u16), badge: 0, rights: Rights::WRITE.union(Rights::GRANT) };
         *state.cnodes.get_mut(keystore_cnode.0 as usize).unwrap().slot_mut(SOURCE_SLOT).unwrap() = source;
 
-        let mut keystore = Keystore::new(keystore_tcb, 0);
+        let mut keystore = Keystore::new(0);
         let aead_key = keystore.generate_aead_key([3u8; aead::AEAD_KEY_LEN]).unwrap();
         state.scheduler.current = Some(keystore_tcb);
         let aead_badge = keystore
-            .request_key_access(&mut state, aead_key, KeyOps::ENCRYPT.union(KeyOps::DECRYPT), SOURCE_SLOT, SCRATCH_SLOT)
+            .request_key_access(
+                &mut KernelBackend::new(&mut state, keystore_tcb),
+                aead_key,
+                KeyOps::ENCRYPT.union(KeyOps::DECRYPT),
+                SOURCE_SLOT,
+                SCRATCH_SLOT,
+            )
             .unwrap();
 
         // The filesystem-service thread: Store itself, with its own self-CNode cap
         // and its own GRANT-able source capability for file-access grants.
         let (store_cnode, store_tcb) = new_cnode_and_tcb(&mut state);
         let notif_idx = state.notifications.alloc(Notification::new()).unwrap();
-        let source = Capability::Notification { id: NotificationId(notif_idx as u16), badge: 0, rights: Rights::READ.union(Rights::GRANT) };
+        let source = Capability::Notification { id: NotificationId(notif_idx as u16), badge: 0, rights: Rights::WRITE.union(Rights::GRANT) };
         *state.cnodes.get_mut(store_cnode.0 as usize).unwrap().slot_mut(SOURCE_SLOT).unwrap() = source;
 
         let ep_idx = state.endpoints.alloc(lantern_kernel::object::Endpoint::new()).unwrap();
         let ep = Capability::Endpoint { id: EndpointId(ep_idx as u16), badge: 0, rights: Rights::ALL };
         *state.cnodes.get_mut(store_cnode.0 as usize).unwrap().slot_mut(1).unwrap() = ep;
 
-        let store = Store::new(store_tcb, 0, aead_badge, aead_key);
+        let store = Store::new(0, aead_badge, aead_key);
 
         Fixture { state, keystore, store, store_tcb, store_ep_cptr: 1, store_ep: ep, aead_key }
     }
@@ -485,8 +501,13 @@ mod tests {
         recv_frame.set_mr(1, CLIENT_DEST_SLOT);
         ipc::recv(&mut f.state, client_tcb, f.store_ep_cptr, &mut recv_frame).unwrap();
 
-        let badge = f.store.request_file_access(&mut f.state, file, ops, SOURCE_SLOT, scratch_slot).unwrap();
-        f.store.deliver_grant(&mut f.state, f.store_ep_cptr, scratch_slot, (0, 0)).unwrap();
+        let badge = f
+            .store
+            .request_file_access(&mut KernelBackend::new(&mut f.state, f.store_tcb), file, ops, SOURCE_SLOT, scratch_slot)
+            .unwrap();
+        f.store
+            .deliver_grant(&mut KernelBackend::new(&mut f.state, f.store_tcb), f.store_ep_cptr, scratch_slot, (0, 0))
+            .unwrap();
         (client_tcb, badge)
     }
 

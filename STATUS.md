@@ -1,6 +1,6 @@
 # lantern-filesystem — Status
 
-**Phase:** 2 — opened per [RFC-0009](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0009-phase-1-to-phase-2-transition.md)/[ADR-0014](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0014-phase-1-complete-phase-2-opened.md), **closed** per [RFC-0017](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0017-phase-2-to-phase-3-transition.md)/[ADR-0021](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0021-phase-2-complete-phase-3-opened.md): the Phase 2 exit criterion is met (a confined Wasm app reads a file *only* via a granted capability — `lantern-example-signer`). This crate's "Next" items (chunking, per-object keys, version history) continue; the Roadmap's gate has moved to Phase 3. **Carried forward (ADR-0021), in progress:** `Store`'s methods take `&mut KernelState` — the deployable confined-IPC-service form is Phase 3's foundational port ([RFC-0018](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0018-confined-execution-port.md)/[ADR-0022](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0022-confined-service-model-and-call-transport.md), Accepted). As of 2026-09-05 the composed `Broker` runs on the new `BrokerBackend` abstraction: `Store` threads a `lantern_capabilities::KernelBackend` internally at its 4 broker call sites (mechanical; its own public `&mut KernelState` API is unchanged, 12 tests green). Its own confinement — `Store`'s logic moving into a program via `lantern_capabilities::Abi`, reached over a badged endpoint + a shared `Frame` — is the remaining ADR-0022 Part 1 work. The READ/WRITE request/reply wire format is now fixed ([RFC-0019](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0019-confined-service-call-protocol.md)/[ADR-0024](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0024-confined-service-call-protocol.md), Accepted 2026-09-12) — badge identifies `(FileId, FileOps)`, offset-based chunking for payloads over one `Frame`. Implementing it against `lantern_abi::frame`'s `Channel` is next.
+**Phase:** 2 — opened per [RFC-0009](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0009-phase-1-to-phase-2-transition.md)/[ADR-0014](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0014-phase-1-complete-phase-2-opened.md), **closed** per [RFC-0017](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0017-phase-2-to-phase-3-transition.md)/[ADR-0021](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0021-phase-2-complete-phase-3-opened.md): the Phase 2 exit criterion is met (a confined Wasm app reads a file *only* via a granted capability — `lantern-example-signer`). This crate's "Next" items (chunking, per-object keys, version history) continue; the Roadmap's gate has moved to Phase 3. **`Store`'s admin API is now confinable** (2026-09-13, mirroring `lantern_crypto::Keystore`'s identical treatment): `request_file_access`/`deliver_grant`/`deliver_grant_via_reply` take `&mut impl BrokerBackend`, `default-features = false` links only `lantern-abi`/`lantern-crypto`. **`Store::write`/`Store::read` still take `keystore: &Keystore` directly, in-process** — turning *this* into an IPC call to a separate confined `keystore-service` (the remaining ADR-0022 Part 1 piece for this crate) is real, un-started design work: `Store` would need to become a `Channel` *client* of `keystore-service`, using `lantern_crypto::wire`'s client-side codecs. Deliberately not attempted yet — see "Next".
 
 ## Done
 - Layered CAS + encryption + capability + history design drafted and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
@@ -43,6 +43,19 @@
   rewrite, and the full badge-gating deny-by-default surface (unknown/revoked/wrong-file/
   wrong-op). `cargo clippy -D warnings` clean on host and `riscv64gc-unknown-none-elf`
   (debug and release).
+- **`Store`'s admin methods generalized to `BrokerBackend`** (2026-09-13,
+  [RFC-0018](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0018-confined-execution-port.md)/[ADR-0022](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0022-confined-service-model-and-call-transport.md)) —
+  mechanical, mirroring `lantern_crypto::Keystore`'s same-day port: `Store` dropped its
+  `self_tcb: TcbId` field; `request_file_access`/`deliver_grant`/`deliver_grant_via_reply`
+  take `&mut impl BrokerBackend`. `Cargo.toml` gained the matching `kernel-backend` feature
+  split (`lantern-hal`/`lantern-kernel` optional; unconditional `lantern-abi`,
+  `lantern-capabilities`/`lantern-crypto` both `default-features = false`). Also fixes the
+  same real bug `lantern-crypto` found: `request_file_access` now mints `Rights::WRITE |
+  Rights::GRANT` (was `READ | GRANT` — a confined client couldn't have `Call`ed through it).
+  12 tests still green (`--features kernel-backend`, default); confined
+  (`--no-default-features`) build + clippy clean on host and `riscv64`. **`Store::write`/
+  `Store::read` themselves are unchanged** — still `keystore: &Keystore` by direct reference,
+  in-process only; see the top-of-file note and "Next".
 
 ## Next
 - Multi-block chunking for content larger than `MAX_BLOCK_LEN` — `ARCHITECTURE.md`'s
@@ -54,10 +67,18 @@
   ([RFC-0011](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0011-sealed-capability-token-format.md)) into file-access
   grants once a real consumer needs cross-machine sharing — `lantern-crypto/STATUS.md`'s own
   "Next" already names this crate as the missing concrete consumer.
-- Turning `Store` into deployable confined-service code needs `lantern-runtime`'s
-  not-yet-built confined execution environment, same gap `lantern-capabilities`/
-  `lantern-crypto` both document for `Broker`/`Keystore` — this crate's methods still take
-  `&mut KernelState` directly, valid only for privileged, same-address-space code.
+- **`Store::write`/`Store::read` need to become an IPC *client* of a confined
+  `keystore-service`**, not a direct `&Keystore` reference — the remaining ADR-0022 Part 1
+  piece for this crate, un-started. Concretely: replace `keystore: &Keystore` with something
+  like a `Cipher` trait (`encrypt`/`decrypt` over a nonce/AAD/buffer, no badge/key
+  parameters — those are implicit in *which* granted `Channel` a confined `store-service`
+  holds) with two implementations — an in-process one wrapping a direct `&Keystore` call
+  (what today's tests use) and a `Channel`-based one issuing real `Channel::call`s with
+  `lantern_crypto::wire`'s `OP_ENCRYPT`/`OP_DECRYPT` codecs (already built and unit-tested,
+  `lantern-crypto/STATUS.md`). **Blocked from actually being proven under QEMU either way**
+  by the same `lantern-kernel` scheduling bug blocking `lantern-crypto`'s own keystore-service
+  demo — see `lantern-kernel/STATUS.md`'s "Known Phase 1 gaps" — so this is real design work
+  worth doing, but a live `store-service` demo has to wait for that fix regardless.
   **Progress from the other side:** `lantern-runtime` now exposes a `lantern:host/filesystem`
   WIT interface and the resource-scoped `file`-handle ⇄ badge mapping that reaches it
   ([RFC-0016](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0016-filesystem-wit-interface.md)/[ADR-0019](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0019-filesystem-wit-interface.md),
