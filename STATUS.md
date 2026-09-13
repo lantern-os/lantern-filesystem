@@ -1,6 +1,6 @@
 # lantern-filesystem — Status
 
-**Phase:** 2 — opened per [RFC-0009](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0009-phase-1-to-phase-2-transition.md)/[ADR-0014](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0014-phase-1-complete-phase-2-opened.md), **closed** per [RFC-0017](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0017-phase-2-to-phase-3-transition.md)/[ADR-0021](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0021-phase-2-complete-phase-3-opened.md): the Phase 2 exit criterion is met (a confined Wasm app reads a file *only* via a granted capability — `lantern-example-signer`). This crate's "Next" items (chunking, per-object keys, version history) continue; the Roadmap's gate has moved to Phase 3. **`Store`'s admin API is now confinable** (2026-09-13, mirroring `lantern_crypto::Keystore`'s identical treatment): `request_file_access`/`deliver_grant`/`deliver_grant_via_reply` take `&mut impl BrokerBackend`, `default-features = false` links only `lantern-abi`/`lantern-crypto`. **`Store::write`/`Store::read` still take `keystore: &Keystore` directly, in-process** — turning *this* into an IPC call to a separate confined `keystore-service` (the remaining ADR-0022 Part 1 piece for this crate) is real, un-started design work: `Store` would need to become a `Channel` *client* of `keystore-service`, using `lantern_crypto::wire`'s client-side codecs. Deliberately not attempted yet — see "Next".
+**Phase:** 2 — opened per [RFC-0009](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0009-phase-1-to-phase-2-transition.md)/[ADR-0014](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0014-phase-1-complete-phase-2-opened.md), **closed** per [RFC-0017](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0017-phase-2-to-phase-3-transition.md)/[ADR-0021](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0021-phase-2-complete-phase-3-opened.md): the Phase 2 exit criterion is met (a confined Wasm app reads a file *only* via a granted capability — `lantern-example-signer`). This crate's "Next" items (chunking, per-object keys, version history) continue; the Roadmap's gate has moved to Phase 3. **`Store`'s admin API is confinable** (2026-09-13, mirroring `lantern_crypto::Keystore`'s identical treatment): `request_file_access`/`deliver_grant`/`deliver_grant_via_reply` take `&mut impl BrokerBackend`, `default-features = false` links only `lantern-abi`/`lantern-crypto`. **`Store::write`/`Store::read` now reach the AEAD key through a `Cipher` trait** (same day), with an in-process implementation (`InProcessCipher`, what every test and `lantern-runtime`'s `InProcessFilesystem` use) and a `Channel`-based one (`ChannelCipher`, for a confined `store-service` — the remaining ADR-0022 Part 1 piece for this crate). A live `store-service` demo proving `ChannelCipher` under QEMU is un-started — see "Next".
 
 ## Done
 - Layered CAS + encryption + capability + history design drafted and reviewed ([ARCHITECTURE.md](./ARCHITECTURE.md)).
@@ -53,9 +53,24 @@
   same real bug `lantern-crypto` found: `request_file_access` now mints `Rights::WRITE |
   Rights::GRANT` (was `READ | GRANT` — a confined client couldn't have `Call`ed through it).
   12 tests still green (`--features kernel-backend`, default); confined
-  (`--no-default-features`) build + clippy clean on host and `riscv64`. **`Store::write`/
-  `Store::read` themselves are unchanged** — still `keystore: &Keystore` by direct reference,
-  in-process only; see the top-of-file note and "Next".
+  (`--no-default-features`) build + clippy clean on host and `riscv64`.
+- **`Store::write`/`Store::read` generalized onto a `Cipher` trait** (2026-09-13, same
+  round as the `lantern-kernel` IPC round-trip-loss fix that unblocked this): new
+  `src/cipher.rs` — `Cipher::encrypt`/`decrypt` take only `nonce`/`aad`/`buffer` (no
+  badge/key parameters; those are implicit in *how* a given `Cipher` was constructed).
+  `Store` itself dropped its `aead_badge`/`aead_key` fields entirely — `Store::new` now
+  takes only `self_cnode_cptr`, matching `Broker`'s own "no backend state of its own"
+  split one layer down. Two implementations: `InProcessCipher` (wraps a direct
+  `&Keystore` reference plus the badge/key this store was granted — what every test in
+  this crate, and `lantern-runtime`'s `InProcessFilesystem` stand-in, use) and
+  `ChannelCipher` (issues real `Channel::call`s to a confined `keystore-service` over
+  `lantern_crypto::wire`'s `OP_ENCRYPT`/`OP_DECRYPT` codecs — builds confined,
+  `default-features = false`, unverified under real QEMU yet, see "Next"). 12 tests
+  green (updated to construct an `InProcessCipher` per call); clean clippy on host
+  (default + `--no-default-features`) and `riscv64` (`--no-default-features`).
+  `lantern-runtime`'s `InProcessFilesystem` updated to match (`FilesystemService::read`/
+  `write` build an `InProcessCipher` per call instead of relying on `Store`'s own
+  now-removed fields) — 23+28 `lantern-runtime` tests green.
 
 ## Next
 - Multi-block chunking for content larger than `MAX_BLOCK_LEN` — `ARCHITECTURE.md`'s
@@ -67,18 +82,15 @@
   ([RFC-0011](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0011-sealed-capability-token-format.md)) into file-access
   grants once a real consumer needs cross-machine sharing — `lantern-crypto/STATUS.md`'s own
   "Next" already names this crate as the missing concrete consumer.
-- **`Store::write`/`Store::read` need to become an IPC *client* of a confined
-  `keystore-service`**, not a direct `&Keystore` reference — the remaining ADR-0022 Part 1
-  piece for this crate, un-started. Concretely: replace `keystore: &Keystore` with something
-  like a `Cipher` trait (`encrypt`/`decrypt` over a nonce/AAD/buffer, no badge/key
-  parameters — those are implicit in *which* granted `Channel` a confined `store-service`
-  holds) with two implementations — an in-process one wrapping a direct `&Keystore` call
-  (what today's tests use) and a `Channel`-based one issuing real `Channel::call`s with
-  `lantern_crypto::wire`'s `OP_ENCRYPT`/`OP_DECRYPT` codecs (already built and unit-tested,
-  `lantern-crypto/STATUS.md`). The `lantern-kernel` scheduling bug that blocked
-  `lantern-crypto`'s own keystore-service demo from completing its wire exchange is now
-  fixed (2026-09-13, see `lantern-kernel/STATUS.md`'s "Known Phase 1 gaps") — a live
-  `store-service` demo is no longer blocked on that, just still un-started design work.
+- **A live, confined `store-service` demo proving `ChannelCipher` under real QEMU** — the
+  `Cipher` trait redesign above is done and unit-tested, but `ChannelCipher` itself has
+  only ever been exercised by the type checker, not a real `Channel::call` round trip. A
+  real demo needs *three* confined programs (`keystore-service`, `store-service`, a
+  client) — `store-service` holds a real `Store` but reaches its AEAD key only via a
+  `ChannelCipher` wrapping its own granted `Channel` to `keystore-service`, exactly the
+  shape `lantern-boot-keystore-demo` already proved for the keystore leg alone. No
+  longer blocked on anything (the `lantern-kernel` scheduling bug is fixed) — just
+  un-started integration work.
   **Progress from the other side:** `lantern-runtime` now exposes a `lantern:host/filesystem`
   WIT interface and the resource-scoped `file`-handle ⇄ badge mapping that reaches it
   ([RFC-0016](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0016-filesystem-wit-interface.md)/[ADR-0019](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0019-filesystem-wit-interface.md),

@@ -59,20 +59,30 @@
 //! `lantern-filesystem` built with `default-features = false` links only
 //! `lantern-abi`/`lantern-crypto` — nothing from the TCB.
 //!
-//! **Still same-address-space: [`Store::write`]/[`Store::read`] take
-//! `keystore: &lantern_crypto::Keystore` directly**, not yet a `Channel` to a
-//! separate confined `keystore-service` — unlike the badge-granting methods
-//! above, generalizing these needs `Store` to become an IPC *client* of
-//! `Keystore` (RFC-0019's `keystore` wire protocol on the *sending* side, not
-//! just the receiving side `lantern_crypto::wire::handle_request` already
-//! implements). Real, tracked follow-up work (`STATUS.md`), not done here.
+//! **[`Store::write`]/[`Store::read`] reach the store-wide AEAD key through a
+//! [`cipher::Cipher`]**, not a bare `&Keystore` reference — the RFC-0019
+//! `keystore` wire protocol's *sending* side (the receiving side,
+//! `lantern_crypto::wire::handle_request`, already existed). `Store` itself
+//! holds no key material or badge of its own — same "no backend state of its
+//! own" split `lantern_capabilities::Broker`'s `BrokerBackend` already
+//! established one layer down — so a caller passes whichever
+//! [`cipher::Cipher`] fits its situation: [`cipher::InProcessCipher`] wraps a
+//! direct `&Keystore` reference plus the badge/key this store was granted
+//! (what every test in this crate and `lantern-runtime`'s `InProcessFilesystem`
+//! stand-in use today), or [`cipher::ChannelCipher`] issues real
+//! `Channel::call`s to a confined `keystore-service` over
+//! `lantern_crypto::wire`'s `OP_ENCRYPT`/`OP_DECRYPT` codecs — what a confined
+//! `store-service` (`lantern-boot`'s remaining ADR-0022 Part 1 piece for this
+//! crate) uses instead.
 #![cfg_attr(not(test), no_std)]
 
 use lantern_abi::wire::CPtr;
 use lantern_capabilities::{Broker, BrokerBackend, SyscallError};
-use lantern_crypto::{Keystore, KeyId};
 use lantern_crypto::aead;
 use lantern_crypto::hash;
+
+pub mod cipher;
+pub use cipher::{ChannelCipher, Cipher, InProcessCipher};
 
 /// Fixed capacity, no heap — matches every other Phase 1/2 kernel-adjacent pool in
 /// this project ([`lantern_crypto::Keystore`]'s own convention).
@@ -132,13 +142,25 @@ pub enum StoreError {
     /// The badge names a different file than the one passed in — deny without
     /// revealing which file it *does* match.
     WrongFile,
-    /// The underlying AEAD operation failed, or the composed
-    /// [`lantern_crypto::Keystore`] rejected the request (e.g. its own badge for
-    /// the store's encryption key was revoked).
+    /// The underlying AEAD operation failed, or an in-process
+    /// [`lantern_crypto::Keystore`] rejected the request directly (e.g. its own
+    /// badge for the store's encryption key was revoked) — a
+    /// [`cipher::InProcessCipher`] failure.
     CryptoFailure(lantern_crypto::KeystoreError),
     /// A real kernel-level failure surfaced by the composed
     /// [`lantern_capabilities::Broker`].
     Kernel(SyscallError),
+    /// A [`cipher::ChannelCipher`] marshalling failure — malformed reply,
+    /// oversized payload, or a real kernel-level `SyscallError` surfaced
+    /// through the `Channel` itself, as opposed to a denial the remote
+    /// `keystore-service` *decided on purpose* ([`StoreError::RemoteCryptoDenied`]).
+    Channel(lantern_abi::frame::ChannelError),
+    /// The remote `keystore-service` rejected a [`cipher::ChannelCipher`]
+    /// request over RFC-0019's wire protocol — carries the raw status code
+    /// (`lantern_crypto::wire::status::{ACCESS,INVALID,FAILED}`), which is a
+    /// deliberately lossy four-value map, not the richer
+    /// [`lantern_crypto::KeystoreError`] an in-process cipher can report.
+    RemoteCryptoDenied(u16),
 }
 
 /// One content-addressed, encrypted block. `hash` is computed over the
@@ -176,10 +198,6 @@ struct GrantRecord {
 /// establishes for key material.
 pub struct Store {
     broker: Broker,
-    /// This store's own access to its single v0 encryption key, in the composed
-    /// [`lantern_crypto::Keystore`] — see [`Store::new`]'s precondition doc.
-    aead_badge: u64,
-    aead_key: KeyId,
     files: [Option<FileRecord>; MAX_FILES],
     blocks: [Option<Block>; MAX_BLOCKS],
     grants: [Option<GrantRecord>; MAX_GRANTS],
@@ -189,18 +207,13 @@ impl Store {
     /// `self_cnode_cptr` — forwarded to [`lantern_capabilities::Broker::new`];
     /// see its doc. `Store` carries no `TcbId` of its own — every method that
     /// needs one (the badge-granting methods below) takes a
-    /// `&mut impl BrokerBackend` instead. `aead_badge`/`aead_key` — the
-    /// caller (real store bootstrap code, or a test) is responsible for
-    /// having already obtained these from the composed [`lantern_crypto::Keystore`]
-    /// (`Keystore::generate_aead_key` then `request_key_access`+`deliver_grant`,
-    /// with [`lantern_crypto::KeyOps::ENCRYPT`]/[`lantern_crypto::KeyOps::DECRYPT`]
-    /// both granted) — the same "caller sets up the precondition" discipline
-    /// `Broker::new`'s own `self_cnode_cptr` doc already documents.
-    pub fn new(self_cnode_cptr: CPtr, aead_badge: u64, aead_key: KeyId) -> Self {
+    /// `&mut impl BrokerBackend` instead. `Store` also carries no key material
+    /// or AEAD badge of its own — [`Store::write`]/[`Store::read`] take a
+    /// [`cipher::Cipher`] instead, per-call, the same "no backend state of its
+    /// own" shape.
+    pub fn new(self_cnode_cptr: CPtr) -> Self {
         Self {
             broker: Broker::new(self_cnode_cptr),
-            aead_badge,
-            aead_key,
             files: [const { None }; MAX_FILES],
             blocks: [const { None }; MAX_BLOCKS],
             grants: [None; MAX_GRANTS],
@@ -299,16 +312,15 @@ impl Store {
     }
 
     /// Writes `data` as `file`'s new content, gated on `badge` having been granted
-    /// [`FileOps::WRITE`] for `file`. `keystore` must be the same
-    /// [`lantern_crypto::Keystore`] this store's [`Store::aead_badge`]/
-    /// [`Store::aead_key`] were obtained from.
+    /// [`FileOps::WRITE`] for `file`. `cipher` reaches the store-wide AEAD key —
+    /// see the crate top-level doc and [`cipher::Cipher`].
     ///
     /// Deduplicates against any block this store already holds with the same
     /// plaintext hash (real, not nominal — the block is never re-encrypted, its
     /// refcount is simply incremented), then relinks `file` to it, releasing
     /// `file`'s previous block (if any) — see this crate's top-level doc for why
     /// this is exact, immediate GC rather than a deferred sweep.
-    pub fn write(&mut self, keystore: &Keystore, badge: u64, file: FileId, data: &[u8]) -> Result<(), StoreError> {
+    pub fn write(&mut self, cipher: &mut impl Cipher, badge: u64, file: FileId, data: &[u8]) -> Result<(), StoreError> {
         self.check_access(badge, file, FileOps::WRITE)?;
         if data.len() > MAX_BLOCK_LEN {
             return Err(StoreError::ContentTooLarge);
@@ -323,9 +335,7 @@ impl Store {
             let mut ciphertext = [0u8; MAX_BLOCK_LEN];
             ciphertext[..data.len()].copy_from_slice(data);
             let nonce = nonce_from_hash(&content_hash);
-            let tag = keystore
-                .encrypt(self.aead_badge, self.aead_key, &nonce, content_hash.as_bytes(), &mut ciphertext[..data.len()])
-                .map_err(StoreError::CryptoFailure)?;
+            let tag = cipher.encrypt(&nonce, content_hash.as_bytes(), &mut ciphertext[..data.len()])?;
             self.blocks[slot] = Some(Block { hash: content_hash, ciphertext, len: data.len(), tag, refcount: 1 });
             slot
         };
@@ -346,8 +356,8 @@ impl Store {
 
     /// Reads `file`'s current content into `buf`, gated on `badge` having been
     /// granted [`FileOps::READ`] for `file`. Returns the number of bytes written to
-    /// `buf`'s front. `keystore` — see [`Store::write`]'s doc.
-    pub fn read(&self, keystore: &Keystore, badge: u64, file: FileId, buf: &mut [u8]) -> Result<usize, StoreError> {
+    /// `buf`'s front. `cipher` — see [`Store::write`]'s doc.
+    pub fn read(&self, cipher: &mut impl Cipher, badge: u64, file: FileId, buf: &mut [u8]) -> Result<usize, StoreError> {
         self.check_access(badge, file, FileOps::READ)?;
         let record = self.file_record(file)?;
         let idx = record.block.ok_or(StoreError::FileEmpty)?;
@@ -357,9 +367,7 @@ impl Store {
         }
         let nonce = nonce_from_hash(&block.hash);
         buf[..block.len].copy_from_slice(&block.ciphertext[..block.len]);
-        keystore
-            .decrypt(self.aead_badge, self.aead_key, &nonce, block.hash.as_bytes(), &mut buf[..block.len], &block.tag)
-            .map_err(StoreError::CryptoFailure)?;
+        cipher.decrypt(&nonce, block.hash.as_bytes(), &mut buf[..block.len], &block.tag)?;
         Ok(block.len)
     }
 
@@ -389,7 +397,7 @@ fn nonce_from_hash(h: &hash::Hash) -> [u8; aead::NONCE_LEN] {
 mod tests {
     use super::*;
     use lantern_capabilities::KernelBackend;
-    use lantern_crypto::KeyOps;
+    use lantern_crypto::{KeyId, KeyOps, Keystore};
     use lantern_hal::{MessageTag, TrapFrame};
     use lantern_kernel::cap::{CNode, CNodeId, Capability, EndpointId, NotificationId, Rights, TcbId};
     use lantern_kernel::ipc;
@@ -415,8 +423,10 @@ mod tests {
         store_tcb: TcbId,
         store_ep_cptr: CPtr,
         store_ep: Capability,
+        aead_badge: u64,
         aead_key: KeyId,
     }
+
 
     fn new_cnode_and_tcb(state: &mut KernelState) -> (CNodeId, TcbId) {
         let cnode = CNodeId(state.cnodes.alloc(CNode::empty()).unwrap() as u16);
@@ -459,9 +469,9 @@ mod tests {
         let ep = Capability::Endpoint { id: EndpointId(ep_idx as u16), badge: 0, rights: Rights::ALL };
         *state.cnodes.get_mut(store_cnode.0 as usize).unwrap().slot_mut(1).unwrap() = ep;
 
-        let store = Store::new(0, aead_badge, aead_key);
+        let store = Store::new(0);
 
-        Fixture { state, keystore, store, store_tcb, store_ep_cptr: 1, store_ep: ep, aead_key }
+        Fixture { state, keystore, store, store_tcb, store_ep_cptr: 1, store_ep: ep, aead_badge, aead_key }
     }
 
     /// Spawns a fresh client thread holding `store`'s shared endpoint at slot 1,
@@ -516,10 +526,11 @@ mod tests {
         let mut f = setup();
         let file = f.store.create().unwrap();
         let (_, badge) = grant_access(&mut f, file, FileOps::ALL, SCRATCH_SLOT);
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
 
-        f.store.write(&f.keystore, badge, file, b"hello, lantern").unwrap();
+        f.store.write(&mut cipher, badge, file, b"hello, lantern").unwrap();
         let mut buf = [0u8; 32];
-        let n = f.store.read(&f.keystore, badge, file, &mut buf).unwrap();
+        let n = f.store.read(&mut cipher, badge, file, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"hello, lantern");
     }
 
@@ -528,9 +539,10 @@ mod tests {
         let mut f = setup();
         let file = f.store.create().unwrap();
         let (_, badge) = grant_access(&mut f, file, FileOps::ALL, SCRATCH_SLOT);
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
 
         let mut buf = [0u8; 32];
-        assert_eq!(f.store.read(&f.keystore, badge, file, &mut buf), Err(StoreError::FileEmpty));
+        assert_eq!(f.store.read(&mut cipher, badge, file, &mut buf), Err(StoreError::FileEmpty));
     }
 
     #[test]
@@ -540,9 +552,10 @@ mod tests {
         let file_b = f.store.create().unwrap();
         let (_, badge_a) = grant_access(&mut f, file_a, FileOps::ALL, SCRATCH_SLOT);
         let (_, badge_b) = grant_access(&mut f, file_b, FileOps::ALL, SCRATCH_SLOT + 1);
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
 
-        f.store.write(&f.keystore, badge_a, file_a, b"same content").unwrap();
-        f.store.write(&f.keystore, badge_b, file_b, b"same content").unwrap();
+        f.store.write(&mut cipher, badge_a, file_a, b"same content").unwrap();
+        f.store.write(&mut cipher, badge_b, file_b, b"same content").unwrap();
 
         let live_blocks = f.store.blocks.iter().flatten().count();
         assert_eq!(live_blocks, 1, "identical plaintext must dedup into a single stored block");
@@ -550,7 +563,7 @@ mod tests {
         // Destroying one file's reference must not disturb the other's.
         f.store.destroy(file_a).unwrap();
         let mut buf = [0u8; 32];
-        let n = f.store.read(&f.keystore, badge_b, file_b, &mut buf).unwrap();
+        let n = f.store.read(&mut cipher, badge_b, file_b, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"same content");
     }
 
@@ -559,7 +572,8 @@ mod tests {
         let mut f = setup();
         let file = f.store.create().unwrap();
         let (_, badge) = grant_access(&mut f, file, FileOps::ALL, SCRATCH_SLOT);
-        f.store.write(&f.keystore, badge, file, b"solo content").unwrap();
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
+        f.store.write(&mut cipher, badge, file, b"solo content").unwrap();
         assert_eq!(f.store.blocks.iter().flatten().count(), 1);
 
         f.store.destroy(file).unwrap();
@@ -571,13 +585,14 @@ mod tests {
         let mut f = setup();
         let file = f.store.create().unwrap();
         let (_, badge) = grant_access(&mut f, file, FileOps::ALL, SCRATCH_SLOT);
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
 
-        f.store.write(&f.keystore, badge, file, b"first version").unwrap();
-        f.store.write(&f.keystore, badge, file, b"second version").unwrap();
+        f.store.write(&mut cipher, badge, file, b"first version").unwrap();
+        f.store.write(&mut cipher, badge, file, b"second version").unwrap();
         assert_eq!(f.store.blocks.iter().flatten().count(), 1, "the first version's block must be released, not leaked");
 
         let mut buf = [0u8; 32];
-        let n = f.store.read(&f.keystore, badge, file, &mut buf).unwrap();
+        let n = f.store.read(&mut cipher, badge, file, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"second version");
     }
 
@@ -586,9 +601,10 @@ mod tests {
         let mut f = setup();
         let file = f.store.create().unwrap();
         let (_, badge) = grant_access(&mut f, file, FileOps::ALL, SCRATCH_SLOT);
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
 
-        f.store.write(&f.keystore, badge, file, b"stable content").unwrap();
-        f.store.write(&f.keystore, badge, file, b"stable content").unwrap();
+        f.store.write(&mut cipher, badge, file, b"stable content").unwrap();
+        f.store.write(&mut cipher, badge, file, b"stable content").unwrap();
         f.store.destroy(file).unwrap();
         assert_eq!(f.store.blocks.iter().flatten().count(), 0, "a refcount that drifted high would leak the block here");
     }
@@ -598,7 +614,8 @@ mod tests {
         let mut f = setup();
         let file = f.store.create().unwrap();
         let (_, badge) = grant_access(&mut f, file, FileOps::READ, SCRATCH_SLOT);
-        assert_eq!(f.store.write(&f.keystore, badge, file, b"nope"), Err(StoreError::OpNotGranted));
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
+        assert_eq!(f.store.write(&mut cipher, badge, file, b"nope"), Err(StoreError::OpNotGranted));
     }
 
     #[test]
@@ -607,8 +624,9 @@ mod tests {
         let file_a = f.store.create().unwrap();
         let file_b = f.store.create().unwrap();
         let (_, badge_a) = grant_access(&mut f, file_a, FileOps::ALL, SCRATCH_SLOT);
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
 
-        assert_eq!(f.store.write(&f.keystore, badge_a, file_b, b"nope"), Err(StoreError::WrongFile));
+        assert_eq!(f.store.write(&mut cipher, badge_a, file_b, b"nope"), Err(StoreError::WrongFile));
     }
 
     #[test]
@@ -617,7 +635,8 @@ mod tests {
         let file = f.store.create().unwrap();
         let (_, badge) = grant_access(&mut f, file, FileOps::ALL, SCRATCH_SLOT);
         f.store.revoke_access(badge).unwrap();
-        assert_eq!(f.store.write(&f.keystore, badge, file, b"nope"), Err(StoreError::BadgeRevoked));
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
+        assert_eq!(f.store.write(&mut cipher, badge, file, b"nope"), Err(StoreError::BadgeRevoked));
     }
 
     #[test]
@@ -634,8 +653,9 @@ mod tests {
         let mut f = setup();
         let file = f.store.create().unwrap();
         let (_, badge) = grant_access(&mut f, file, FileOps::ALL, SCRATCH_SLOT);
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
         let oversized = [0u8; MAX_BLOCK_LEN + 1];
-        assert_eq!(f.store.write(&f.keystore, badge, file, &oversized), Err(StoreError::ContentTooLarge));
+        assert_eq!(f.store.write(&mut cipher, badge, file, &oversized), Err(StoreError::ContentTooLarge));
     }
 
     #[test]
