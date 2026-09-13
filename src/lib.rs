@@ -82,6 +82,7 @@ use lantern_crypto::aead;
 use lantern_crypto::hash;
 
 pub mod cipher;
+pub mod wire;
 pub use cipher::{ChannelCipher, Cipher, InProcessCipher};
 
 /// Fixed capacity, no heap — matches every other Phase 1/2 kernel-adjacent pool in
@@ -293,6 +294,19 @@ impl Store {
     /// Forwards to [`lantern_capabilities::Broker::revoke`]; see its doc.
     pub fn revoke_access(&mut self, badge: u64) -> Result<(), StoreError> {
         self.broker.revoke(badge).map_err(StoreError::Kernel)
+    }
+
+    /// The [`FileId`] `badge` was granted against, or `None` if this store
+    /// never granted `badge` at all. Mirrors
+    /// [`lantern_crypto::Keystore::key_for_badge`] — RFC-0019's wire protocol
+    /// carries no file argument, "the badge alone identifies `(FileId,
+    /// FileOps)`", so a confined `store-service`'s request dispatcher
+    /// ([`crate::wire`]) needs this to turn an incoming badge into the `file`
+    /// argument [`Store::read`]/[`Store::write`] still take. Deliberately
+    /// does **not** also check revocation/ops here (unlike
+    /// `Store::check_access`) — this only answers "which file, if any."
+    pub fn file_for_badge(&self, badge: u64) -> Option<FileId> {
+        self.grants.iter().flatten().find(|g| g.badge == badge).map(|g| g.file)
     }
 
     /// **Deny by default** — see [`lantern_crypto::Keystore::check_access`]'s doc;
