@@ -75,10 +75,10 @@
   holds) with two implementations — an in-process one wrapping a direct `&Keystore` call
   (what today's tests use) and a `Channel`-based one issuing real `Channel::call`s with
   `lantern_crypto::wire`'s `OP_ENCRYPT`/`OP_DECRYPT` codecs (already built and unit-tested,
-  `lantern-crypto/STATUS.md`). **Blocked from actually being proven under QEMU either way**
-  by the same `lantern-kernel` scheduling bug blocking `lantern-crypto`'s own keystore-service
-  demo — see `lantern-kernel/STATUS.md`'s "Known Phase 1 gaps" — so this is real design work
-  worth doing, but a live `store-service` demo has to wait for that fix regardless.
+  `lantern-crypto/STATUS.md`). The `lantern-kernel` scheduling bug that blocked
+  `lantern-crypto`'s own keystore-service demo from completing its wire exchange is now
+  fixed (2026-09-13, see `lantern-kernel/STATUS.md`'s "Known Phase 1 gaps") — a live
+  `store-service` demo is no longer blocked on that, just still un-started design work.
   **Progress from the other side:** `lantern-runtime` now exposes a `lantern:host/filesystem`
   WIT interface and the resource-scoped `file`-handle ⇄ badge mapping that reaches it
   ([RFC-0016](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0016-filesystem-wit-interface.md)/[ADR-0019](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0019-filesystem-wit-interface.md),
