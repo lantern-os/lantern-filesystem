@@ -98,6 +98,16 @@
   regression-checked together. Clean riscv64 release build + clippy on both new
   standalone crates and the updated `lantern-boot` binary.
 
+- **`FileId::from_raw`** (2026-10-12) — the `lantern_crypto::KeyId::from_raw` twin, for
+  the same reason: a confined `lantern-runtime` process building an `IpcFilesystem`-backed
+  `HostFile` holds a badged `Channel`, not a `Store`, and RFC-0019's `store` protocol names
+  the file by badge alone. Checked before adding it: every `Store` path bounds-checks a
+  `FileId` (`file_record`/`destroy` use `.get()`) or compares it against a real grant by
+  equality (`check_access`) before indexing, so a fabricated id fails cleanly. New test
+  `a_fabricated_file_id_never_panics_against_a_real_store`. Used by
+  `lantern-runtime/confined-runtime`'s filesystem binary
+  (`lantern-boot-runtime-fs-demo`).
+
 ## Next
 - Multi-block chunking for content larger than `MAX_BLOCK_LEN` — `ARCHITECTURE.md`'s
   "efficient large-file... patterns over CAS" open question.

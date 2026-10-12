@@ -100,6 +100,30 @@ const MAX_GRANTS: usize = 32;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct FileId(u16);
 
+impl FileId {
+    /// Constructs a `FileId` from a raw index without going through
+    /// [`Store::create`] — the filesystem twin of `lantern_crypto::KeyId::from_raw`,
+    /// for the same reason.
+    ///
+    /// **Only for a caller with no real `Store` to get one from** — namely
+    /// `lantern-runtime`'s `IpcFilesystem`-backed `HostFile` construction (RFC-0018
+    /// Part 2): a confined runtime process holds a badged `Channel` endpoint, not a
+    /// `Store`, and `IpcFilesystem`'s own `read`/`write` never consult the `file:
+    /// FileId` a `HostFile` carries — RFC-0019's `store` protocol identifies the file
+    /// purely by the kernel-delivered badge on the far end. This value is bookkeeping
+    /// for that backend, not a real file-table index.
+    ///
+    /// **Always panic-safe, meaningful only against the `Store` that actually assigned
+    /// it.** Every path bounds-checks `id` (`file_record`/`destroy` use `.get()`) or
+    /// compares it by equality against a real grant (`check_access`) before indexing
+    /// with it — an arbitrary `id` passed to a real `Store` fails gracefully
+    /// (`WrongFile`/`NoSuchFile`). Don't use this to fabricate a `FileId` you then hand
+    /// to a real, in-process `Store` expecting it to name a specific file.
+    pub const fn from_raw(id: u16) -> Self {
+        Self(id)
+    }
+}
+
 /// The operations a granted badge may be scoped to — orthogonal to
 /// [`lantern_kernel::cap::Rights`], mirroring
 /// [`lantern_crypto::KeyOps`]'s exact split between kernel-level transfer rights
@@ -630,6 +654,25 @@ mod tests {
         let (_, badge) = grant_access(&mut f, file, FileOps::READ, SCRATCH_SLOT);
         let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
         assert_eq!(f.store.write(&mut cipher, badge, file, b"nope"), Err(StoreError::OpNotGranted));
+    }
+
+    #[test]
+    fn a_fabricated_file_id_never_panics_against_a_real_store() {
+        // FileId::from_raw's panic-safety claim, against a real, Broker-granted Store.
+        let mut f = setup();
+        let real_file = f.store.create().unwrap();
+        let (_, badge) = grant_access(&mut f, real_file, FileOps::ALL, SCRATCH_SLOT);
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
+
+        // In range but not the granted file: a clean WrongFile, not a panic.
+        let wrong_file = FileId::from_raw(if real_file.0 == 0 { 1 } else { 0 });
+        assert_eq!(f.store.write(&mut cipher, badge, wrong_file, b"nope"), Err(StoreError::WrongFile));
+
+        // Out of range entirely: still clean errors, never an out-of-bounds panic.
+        let out_of_range = FileId::from_raw(u16::MAX);
+        assert!(f.store.write(&mut cipher, badge, out_of_range, b"nope").is_err());
+        assert!(f.store.read(&mut cipher, badge, out_of_range, &mut [0u8; 8]).is_err());
+        assert_eq!(f.store.destroy(out_of_range), Err(StoreError::NoSuchFile));
     }
 
     #[test]
