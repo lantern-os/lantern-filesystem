@@ -137,6 +137,20 @@ impl FileOps {
     pub const WRITE: FileOps = FileOps(1 << 1);
     pub const ALL: FileOps = FileOps(Self::READ.0 | Self::WRITE.0);
 
+    /// These ops as the bits RFC-0020's `GRANT` carries.
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The inverse of [`FileOps::bits`]: `None` for an unknown bit.
+    pub const fn from_bits(bits: u8) -> Option<FileOps> {
+        if bits & !FileOps::ALL.0 == 0 {
+            Some(FileOps(bits))
+        } else {
+            None
+        }
+    }
+
     pub const fn union(self, other: FileOps) -> FileOps {
         FileOps(self.0 | other.0)
     }
@@ -441,6 +455,13 @@ mod tests {
     use lantern_kernel::ipc;
     use lantern_kernel::object::{Notification, Tcb};
     use lantern_kernel::state::KernelState;
+
+    #[test]
+    fn ops_bits_round_trip_and_unknown_bits_are_refused() {
+        let ops = FileOps::READ.union(FileOps::WRITE);
+        assert_eq!(FileOps::from_bits(ops.bits()).map(FileOps::bits), Some(ops.bits()));
+        assert!(FileOps::from_bits(0x80).is_none());
+    }
 
     const SOURCE_SLOT: CPtr = 5;
     const SCRATCH_SLOT: CPtr = 6;

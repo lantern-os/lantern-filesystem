@@ -108,6 +108,9 @@
   `lantern-runtime/confined-runtime`'s filesystem binary
   (`lantern-boot-runtime-fs-demo`).
 
+- **`FileOps::bits` / `from_bits` (2026-11-02):** what [RFC-0020](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0020-launch-binder.md)'s
+  `GRANT` carries. `from_bits` refuses unknown bits.
+
 ## Next
 - Multi-block chunking for content larger than `MAX_BLOCK_LEN` — `ARCHITECTURE.md`'s
   "efficient large-file... patterns over CAS" open question.
