@@ -347,6 +347,12 @@ impl Store {
         self.grants.iter().flatten().find(|g| g.badge == badge).map(|g| g.file)
     }
 
+    /// Whether `badge` is refused outright: revoked, or never minted here. For a service
+    /// loop deciding whether to send another reply chunk (RFC-0021).
+    pub fn is_revoked(&self, badge: u64) -> bool {
+        self.broker.is_revoked(badge)
+    }
+
     /// **Deny by default** — see [`lantern_crypto::Keystore::check_access`]'s doc;
     /// this is the same check, one layer up.
     fn check_access(&self, badge: u64, file: FileId, op: FileOps) -> Result<(), StoreError> {
