@@ -17,7 +17,8 @@ at rest and the integrity/provenance of stored objects (system threats T1, T6).
 | F3 | Silent tampering with stored data | Content addressing: any change changes the hash; verified on read. |
 | F4 | Forged provenance (agent disowns/blames a write) | Provenance bound to the capability used; recorded in immutable history. |
 | F5 | A compromised filesystem service reads everything | Confined service; holds caps only to mounted objects; keys stay in crypto service. |
-| F6 | Metadata leakage (sizes, access patterns) | Acknowledged; padding/oblivious-access are research directions, not solved at Phase 0. |
+| F6 | Metadata leakage (sizes, access patterns) | Acknowledged; padding/oblivious-access are research directions, not solved at Phase 0. The audit log now records each read's and write's size and order, on unencrypted flash until Phase 4 ([ADR-0030](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0030-audit-log-service-operations.md)). |
+| F7 | The audit log is unavailable or refuses | An audited `store-service` doesn't run a read or write it can't record, and answers `FAILED` (ADR-0030): failing closed. |
 
 ## Non-goals
 - Hiding all access-pattern metadata (Phase 0).

@@ -114,6 +114,9 @@
   chunk ([RFC-0021](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0021-grant-ledger-and-revocation.md)). `store-service` now reaches
   `revoke_access` over `REVOKE`, from the launch binder.
 
+- **`FileId::raw` (2026-11-10):** the inverse of `from_raw`, which is what the audit log records as an operation's `object`
+  ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)/[ADR-0030](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0030-audit-log-service-operations.md)). The confined service records each use of a grant before running it; this crate's own API is unchanged.
+
 ## Next
 - Multi-block chunking for content larger than `MAX_BLOCK_LEN` — `ARCHITECTURE.md`'s
   "efficient large-file... patterns over CAS" open question.
