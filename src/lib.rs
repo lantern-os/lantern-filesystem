@@ -122,6 +122,13 @@ impl FileId {
     pub const fn from_raw(id: u16) -> Self {
         Self(id)
     }
+
+    /// The raw value, the inverse of [`FileId::from_raw`]: what the audit log records as a grant's or an
+    /// operation's `object` ([RFC-0025](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0025-audit-log-service-operations.md)).
+    /// Naming an object this way conveys no access to it.
+    pub const fn raw(self) -> u16 {
+        self.0
+    }
 }
 
 /// The operations a granted badge may be scoped to — orthogonal to
