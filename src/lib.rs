@@ -313,7 +313,13 @@ impl Store {
         if record.destroyed {
             return Err(StoreError::FileDestroyed);
         }
-        let slot = self.grants.iter().position(Option::is_none).ok_or(StoreError::NotEnoughCapacity)?;
+        // A free record, or else one whose badge is revoked: see `Broker::mint`, which forgets the same way.
+        let slot = self
+            .grants
+            .iter()
+            .position(Option::is_none)
+            .or_else(|| self.grants.iter().position(|g| g.is_some_and(|g| self.broker.is_revoked(g.badge))))
+            .ok_or(StoreError::NotEnoughCapacity)?;
         let badge = self.broker
             .mint(
                 backend,
