@@ -82,6 +82,7 @@ use lantern_crypto::aead;
 use lantern_crypto::hash;
 
 pub mod cipher;
+pub mod image;
 pub mod wire;
 pub use cipher::{ChannelCipher, Cipher, InProcessCipher};
 
@@ -196,6 +197,9 @@ pub enum StoreError {
     /// A real kernel-level failure surfaced by the composed
     /// [`lantern_capabilities::Broker`].
     Kernel(SyscallError),
+    /// A store image ([`image`]) that isn't one, doesn't verify under the store's key, or isn't consistent. Nothing of it
+    /// is used.
+    ImageInvalid,
     /// A [`cipher::ChannelCipher`] marshalling failure — malformed reply,
     /// oversized payload, or a real kernel-level `SyscallError` surfaced
     /// through the `Channel` itself, as opposed to a denial the remote

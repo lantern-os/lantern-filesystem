@@ -75,7 +75,12 @@ fn status_for(err: StoreError) -> u16 {
         | StoreError::NoSuchFile
         | StoreError::FileDestroyed => status::ACCESS,
         StoreError::ContentTooLarge => status::INVALID,
-        StoreError::NotEnoughCapacity | StoreError::CryptoFailure(_) | StoreError::Channel(_) | StoreError::RemoteCryptoDenied(_) | StoreError::Kernel(_) => {
+        StoreError::NotEnoughCapacity
+        | StoreError::CryptoFailure(_)
+        | StoreError::Channel(_)
+        | StoreError::RemoteCryptoDenied(_)
+        | StoreError::Kernel(_)
+        | StoreError::ImageInvalid => {
             status::FAILED
         }
         // `read`'s own caller-buffer-too-small case never reaches here — this

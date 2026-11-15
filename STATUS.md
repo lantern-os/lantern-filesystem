@@ -120,6 +120,11 @@
 - **Grant records are reused once revoked (2026-11-14, [RFC-0029](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0029-a-confined-launcher.md)/[ADR-0035](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0035-a-confined-launcher.md)).** When every record is taken, `Store::request_file_access` reuses a revoked
   badge's. That's safe: a badge is never minted twice, and one no longer remembered reads as revoked. Without it, the
   interactive system's services would refuse every grant after about 30 app runs. Tested.
+- **The store on a disk (2026-11-14, [RFC-0031](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0031-storage-a-block-driver-and-the-store-on-disk.md)/[ADR-0036](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0036-storage-a-block-driver-and-the-store-on-disk.md)).** `image`: the whole store as one sealed image, with every file's record
+  and every block. A BLAKE3 digest covers the whole, and is sealed through the `Cipher` as an AEAD tag over no plaintext.
+  `load_image` refuses anything that doesn't verify, or isn't consistent, as `ImageInvalid`. 4 tests: a round trip, any
+  changed byte or a torn image, another key, and an authentic but inconsistent image. **Rollback isn't prevented**:
+  RFC-0023's checklist. 25 tests.
 ## Next
 - Multi-block chunking for content larger than `MAX_BLOCK_LEN` — `ARCHITECTURE.md`'s
   "efficient large-file... patterns over CAS" open question.
