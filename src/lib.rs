@@ -76,6 +76,7 @@
 //! crate) uses instead.
 #![cfg_attr(not(test), no_std)]
 
+use lantern_abi::provenance::{self, Entry};
 use lantern_abi::wire::CPtr;
 use lantern_capabilities::{Broker, BrokerBackend, SyscallError};
 use lantern_crypto::aead;
@@ -232,6 +233,14 @@ struct FileRecord {
     /// badge-visible identifier (contrast [`FileId`] itself).
     block: Option<usize>,
     destroyed: bool,
+    /// [RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md): its last writes, newest first.
+    history: [Option<Entry>; provenance::ENTRIES],
+}
+
+impl FileRecord {
+    const fn new() -> Self {
+        Self { block: None, destroyed: false, history: [None; provenance::ENTRIES] }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -239,6 +248,8 @@ struct GrantRecord {
     badge: u64,
     file: FileId,
     ops: FileOps,
+    /// Who the binder made the grant for, or `provenance::NONE`.
+    principal: provenance::Principal,
 }
 
 /// The content-addressed store: owns block/file bookkeeping and a composed
@@ -251,6 +262,9 @@ pub struct Store {
     files: [Option<FileRecord>; MAX_FILES],
     blocks: [Option<Block>; MAX_BLOCKS],
     grants: [Option<GrantRecord>; MAX_GRANTS],
+    /// Every successful write, counted, and every start, counted: what a provenance entry is dated by.
+    writes: u64,
+    boots: u32,
 }
 
 impl Store {
@@ -267,14 +281,41 @@ impl Store {
             files: [const { None }; MAX_FILES],
             blocks: [const { None }; MAX_BLOCKS],
             grants: [None; MAX_GRANTS],
+            writes: 0,
+            boots: 0,
         }
+    }
+
+    /// Counts one more start of the store, which entries written from now on carry. Call once, after loading its image.
+    pub fn start(&mut self) {
+        self.boots += 1;
+    }
+
+    /// File `index`'s size and how many writes it remembers, or `None` past the last file
+    /// ([RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md)). Never its content.
+    pub fn file_info(&self, index: usize) -> Option<provenance::FileInfo> {
+        let slot = self.files.get(index)?;
+        Some(match slot {
+            None => provenance::FileInfo { exists: false, destroyed: false, len: 0, entries: 0 },
+            Some(f) => provenance::FileInfo {
+                exists: true,
+                destroyed: f.destroyed,
+                len: f.block.and_then(|b| self.blocks[b].as_ref()).map_or(0, |b| b.len),
+                entries: f.history.iter().flatten().count(),
+            },
+        })
+    }
+
+    /// File `index`'s `k`th most recent write.
+    pub fn file_entry(&self, index: usize, k: usize) -> Option<Entry> {
+        *self.files.get(index)?.as_ref()?.history.get(k)?
     }
 
     /// Allocates a new, empty file object. Never reused after
     /// [`Store::destroy`] — see this crate's top-level doc.
     pub fn create(&mut self) -> Result<FileId, StoreError> {
         let idx = self.files.iter().position(Option::is_none).ok_or(StoreError::NotEnoughCapacity)?;
-        self.files[idx] = Some(FileRecord { block: None, destroyed: false });
+        self.files[idx] = Some(FileRecord::new());
         Ok(FileId(idx as u16))
     }
 
@@ -313,6 +354,20 @@ impl Store {
         source_slot: CPtr,
         scratch_slot: CPtr,
     ) -> Result<u64, StoreError> {
+        self.request_file_access_for(backend, file, ops, source_slot, scratch_slot, provenance::NONE)
+    }
+
+    /// [`Store::request_file_access`], for `principal`, which every write the badge makes records
+    /// ([RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md)). Only the binder names a principal.
+    pub fn request_file_access_for(
+        &mut self,
+        backend: &mut impl BrokerBackend,
+        file: FileId,
+        ops: FileOps,
+        source_slot: CPtr,
+        scratch_slot: CPtr,
+        principal: provenance::Principal,
+    ) -> Result<u64, StoreError> {
         let record = self.file_record(file)?;
         if record.destroyed {
             return Err(StoreError::FileDestroyed);
@@ -332,7 +387,7 @@ impl Store {
                 lantern_capabilities::Rights::WRITE.union(lantern_capabilities::Rights::GRANT),
             )
             .map_err(StoreError::Kernel)?;
-        self.grants[slot] = Some(GrantRecord { badge, file, ops });
+        self.grants[slot] = Some(GrantRecord { badge, file, ops, principal });
         Ok(badge)
     }
 
@@ -397,9 +452,45 @@ impl Store {
     /// this is exact, immediate GC rather than a deferred sweep.
     pub fn write(&mut self, cipher: &mut impl Cipher, badge: u64, file: FileId, data: &[u8]) -> Result<(), StoreError> {
         self.check_access(badge, file, FileOps::WRITE)?;
+        // Who wrote it, as the binder named the grant: the writer never says.
+        let principal = self.grants.iter().flatten().find(|g| g.badge == badge).map_or(provenance::NONE, |g| g.principal);
+        self.put(cipher, file, data, principal)
+    }
+
+    /// [RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md): what a person writes at the
+    /// console, with no grant, recorded as [`provenance::CONSOLE`]. The store's program calls this only for a request
+    /// under `provenance::STORE_CONSOLE_BADGE`, which only the shell holds.
+    pub fn write_from_console(&mut self, cipher: &mut impl Cipher, file: FileId, data: &[u8]) -> Result<(), StoreError> {
+        if self.file_record(file)?.destroyed {
+            return Err(StoreError::FileDestroyed);
+        }
+        self.put(cipher, file, data, provenance::CONSOLE)
+    }
+
+    /// What a person reads at the console: `file`'s content, with no grant. As [`write_from_console`](Self::write_from_console),
+    /// only for a request under `provenance::STORE_CONSOLE_BADGE`.
+    pub fn read_from_console(&self, cipher: &mut impl Cipher, file: FileId, buf: &mut [u8]) -> Result<usize, StoreError> {
+        if self.file_record(file)?.destroyed {
+            return Err(StoreError::FileDestroyed);
+        }
+        self.open(cipher, file, buf)
+    }
+
+    /// Creates files until there are at least `count`, for a store whose policy names them: an image from before they
+    /// were named has fewer.
+    pub fn ensure_files(&mut self, count: usize) -> Result<(), StoreError> {
+        while self.files.iter().take(count).any(Option::is_none) {
+            self.create()?;
+        }
+        Ok(())
+    }
+
+    /// Replaces `file`'s content with `data`, recording `principal` as its writer. The file must exist.
+    fn put(&mut self, cipher: &mut impl Cipher, file: FileId, data: &[u8], principal: provenance::Principal) -> Result<(), StoreError> {
         if data.len() > MAX_BLOCK_LEN {
             return Err(StoreError::ContentTooLarge);
         }
+        self.file_record(file)?;
         let content_hash = hash::hash(data);
 
         let new_block = if let Some(idx) = self.find_block(&content_hash) {
@@ -415,7 +506,7 @@ impl Store {
             slot
         };
 
-        let record = self.files[file.0 as usize].as_mut().expect("checked by check_access above");
+        let record = self.files[file.0 as usize].as_mut().expect("checked above");
         if let Some(old) = record.block.replace(new_block) {
             if old != new_block {
                 self.release_block(old);
@@ -426,6 +517,11 @@ impl Store {
                 self.blocks[new_block].as_mut().unwrap().refcount -= 1;
             }
         }
+        self.writes += 1;
+        let entry = Entry { principal, write: self.writes, boot: self.boots };
+        let record = self.files[file.0 as usize].as_mut().expect("checked above");
+        record.history.copy_within(..provenance::ENTRIES - 1, 1);
+        record.history[0] = Some(entry);
         Ok(())
     }
 
@@ -434,6 +530,11 @@ impl Store {
     /// `buf`'s front. `cipher` — see [`Store::write`]'s doc.
     pub fn read(&self, cipher: &mut impl Cipher, badge: u64, file: FileId, buf: &mut [u8]) -> Result<usize, StoreError> {
         self.check_access(badge, file, FileOps::READ)?;
+        self.open(cipher, file, buf)
+    }
+
+    /// `file`'s current content, decrypted into `buf`. A destroyed file has no block, so it reads as empty.
+    fn open(&self, cipher: &mut impl Cipher, file: FileId, buf: &mut [u8]) -> Result<usize, StoreError> {
         let record = self.file_record(file)?;
         let idx = record.block.ok_or(StoreError::FileEmpty)?;
         let block = self.blocks[idx].as_ref().expect("a live file's block index is always a live block");
@@ -582,6 +683,71 @@ mod tests {
     /// occupied. A real service would reclaim/reuse its own scratch slot between
     /// requests (e.g. via `CNodeInvoke::Delete`); this fixture just picks a fresh
     /// one per call instead, since exercising reclamation isn't this crate's job.
+    /// Mints a badge for `principal` without delivering it: enough for the store to record and check it.
+    fn grant_for(f: &mut Fixture, file: FileId, principal: u64) -> u64 {
+        f.state.scheduler.current = Some(f.store_tcb);
+        let cnode = f.state.tcbs.get(f.store_tcb.0 as usize).unwrap().cspace.unwrap();
+        *f.state.cnodes.get_mut(cnode.0 as usize).unwrap().slot_mut(SCRATCH_SLOT).unwrap() = Capability::Null;
+        f.store
+            .request_file_access_for(
+                &mut KernelBackend::new(&mut f.state, f.store_tcb),
+                file,
+                FileOps::READ.union(FileOps::WRITE),
+                SOURCE_SLOT,
+                SCRATCH_SLOT,
+                principal,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn each_write_records_who_the_binder_said_and_a_file_keeps_its_last_four() {
+        let mut f = setup();
+        let file = f.store.create().unwrap();
+        let untouched = f.store.create().unwrap();
+        f.store.start();
+        let first = grant_for(&mut f, file, 0xaaa);
+        let second = grant_for(&mut f, file, 0xbbb);
+        for (i, badge) in [first, first, first, first, second].into_iter().enumerate() {
+            let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
+            f.store.write(&mut cipher, badge, file, &[i as u8; 8]).unwrap();
+        }
+        let info = f.store.file_info(file.0 as usize).unwrap();
+        assert_eq!((info.exists, info.len, info.entries), (true, 8, 4));
+        let entry = |k| f.store.file_entry(file.0 as usize, k);
+        assert_eq!(entry(0), Some(Entry { principal: 0xbbb, write: 5, boot: 1 }), "newest first");
+        assert_eq!(entry(3), Some(Entry { principal: 0xaaa, write: 2, boot: 1 }), "the first write is gone");
+        assert_eq!(entry(4), None);
+        assert_eq!(f.store.file_info(untouched.0 as usize).unwrap().entries, 0);
+        assert_eq!(f.store.file_info(MAX_FILES), None);
+        // A refused write records nothing.
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
+        assert!(f.store.write(&mut cipher, 999, file, b"x").is_err());
+        assert_eq!(f.store.file_entry(file.0 as usize, 0).unwrap().write, 5);
+    }
+
+    #[test]
+    fn a_console_write_is_recorded_as_the_console_and_needs_a_file_that_exists() {
+        let mut f = setup();
+        f.store.ensure_files(3).unwrap();
+        f.store.ensure_files(3).unwrap();
+        assert!(f.store.file_info(2).unwrap().exists && !f.store.file_info(3).unwrap().exists, "made once, three files");
+        f.store.start();
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
+        f.store.write_from_console(&mut cipher, FileId::from_raw(1), b"Once upon a time").unwrap();
+        assert_eq!(f.store.file_entry(1, 0), Some(Entry { principal: provenance::CONSOLE, write: 1, boot: 1 }));
+        let reader = grant_for(&mut f, FileId::from_raw(1), 0xccc);
+        let mut buf = [0u8; 32];
+        let mut cipher = InProcessCipher::new(&f.keystore, f.aead_badge, f.aead_key);
+        let n = f.store.read(&mut cipher, reader, FileId::from_raw(1), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"Once upon a time", "an app granted the file reads what the person wrote");
+        let n = f.store.read_from_console(&mut cipher, FileId::from_raw(1), &mut buf).unwrap();
+        assert_eq!(&buf[..n], b"Once upon a time");
+        assert_eq!(f.store.read_from_console(&mut cipher, FileId::from_raw(2), &mut buf), Err(StoreError::FileEmpty));
+        assert_eq!(f.store.write_from_console(&mut cipher, FileId::from_raw(9), b"x"), Err(StoreError::NoSuchFile));
+        assert_eq!(f.store.write_from_console(&mut cipher, FileId::from_raw(1), &[0; MAX_BLOCK_LEN + 1]), Err(StoreError::ContentTooLarge));
+    }
+
     fn grant_access(f: &mut Fixture, file: FileId, ops: FileOps, scratch_slot: CPtr) -> (TcbId, u64) {
         let (client_cnode, client_tcb) = new_cnode_and_tcb(&mut f.state);
         *f.state.cnodes.get_mut(client_cnode.0 as usize).unwrap().slot_mut(1).unwrap() = f.store_ep;

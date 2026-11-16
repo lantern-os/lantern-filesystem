@@ -2,9 +2,13 @@
 //! what makes its files outlive a reboot.
 //!
 //! ```text
-//! header (sector 0):  "LSTORE01"  seq: u64  body_len: u32  digest: [u8; 32]  tag: [u8; 16]
-//! body:               every file's record, then every block (its plaintext hash, length, refcount, AEAD tag, ciphertext)
+//! header:  "LSTORE02"  seq: u64  body_len: u32  digest: [u8; 32]  tag: [u8; 16]
+//! body:    the store's write and start counts; every file's record with its last writes
+//!          ([RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md)); then every block (its plaintext
+//!          hash, length, refcount, AEAD tag, ciphertext)
 //! ```
+//!
+//! `LSTORE01` images, from before provenance, still load: their files have no history, and both counts start at 0.
 //!
 //! `digest` is BLAKE3 over the magic, `seq`, `body_len` and the body; storing it lets a damaged image be refused before
 //! any keystore call, but it authenticates nothing by itself. `tag` seals the digest, as computed, under the store's key: the
@@ -18,21 +22,25 @@
 
 use super::*;
 
-pub const MAGIC: &[u8; 8] = b"LSTORE01";
+pub const MAGIC: &[u8; 8] = b"LSTORE02";
+const MAGIC_V1: &[u8; 8] = b"LSTORE01";
 pub const HEADER_LEN: usize = 8 + 8 + 4 + hash::HASH_LEN + aead::TAG_LEN;
-const FILE_LEN: usize = 2;
+const COUNTS_LEN: usize = 8 + 4;
+const ENTRY_LEN: usize = 8 + 8 + 4;
+const FILE_LEN_V1: usize = 2;
+const FILE_LEN: usize = 3 + provenance::ENTRIES * ENTRY_LEN;
 const BLOCK_LEN: usize = 1 + hash::HASH_LEN + 2 + 4 + aead::TAG_LEN + MAX_BLOCK_LEN;
-/// The most an image can be: header, every file, every block at its largest.
-pub const IMAGE_MAX: usize = HEADER_LEN + MAX_FILES * FILE_LEN + MAX_BLOCKS * BLOCK_LEN;
+/// The most an image can be: header, counts, every file, every block at its largest.
+pub const IMAGE_MAX: usize = HEADER_LEN + COUNTS_LEN + MAX_FILES * FILE_LEN + MAX_BLOCKS * BLOCK_LEN;
 
 const NO_FILE: u8 = 0;
 const LIVE: u8 = 1;
 const DESTROYED: u8 = 2;
 const NO_BLOCK: u8 = 0xff;
 
-fn digest(seq: u64, body: &[u8]) -> hash::Hash {
+fn digest(magic: &[u8; 8], seq: u64, body: &[u8]) -> hash::Hash {
     let mut hasher = hash::Hasher::new();
-    hasher.update(MAGIC).update(&seq.to_le_bytes()).update(&(body.len() as u32).to_le_bytes()).update(body);
+    hasher.update(magic).update(&seq.to_le_bytes()).update(&(body.len() as u32).to_le_bytes()).update(body);
     hasher.finalize()
 }
 
@@ -49,14 +57,27 @@ impl Store {
         if out.len() < IMAGE_MAX {
             return Err(StoreError::ContentTooLarge);
         }
-        let mut at = HEADER_LEN;
+        out[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&self.writes.to_le_bytes());
+        out[HEADER_LEN + 8..HEADER_LEN + 12].copy_from_slice(&self.boots.to_le_bytes());
+        let mut at = HEADER_LEN + COUNTS_LEN;
         for file in &self.files {
+            out[at..at + FILE_LEN].fill(0);
             let (kind, block) = match file {
                 None => (NO_FILE, NO_BLOCK),
                 Some(f) => (if f.destroyed { DESTROYED } else { LIVE }, f.block.map_or(NO_BLOCK, |b| b as u8)),
             };
             out[at] = kind;
             out[at + 1] = block;
+            if let Some(f) = file {
+                let entries: &[Option<Entry>] = &f.history;
+                out[at + 2] = entries.iter().flatten().count() as u8;
+                for (i, e) in entries.iter().flatten().enumerate() {
+                    let e_at = at + 3 + i * ENTRY_LEN;
+                    out[e_at..e_at + 8].copy_from_slice(&e.principal.to_le_bytes());
+                    out[e_at + 8..e_at + 16].copy_from_slice(&e.write.to_le_bytes());
+                    out[e_at + 16..e_at + 20].copy_from_slice(&e.boot.to_le_bytes());
+                }
+            }
             at += FILE_LEN;
         }
         for block in &self.blocks {
@@ -77,7 +98,7 @@ impl Store {
             }
         }
         let body_len = at - HEADER_LEN;
-        let digest = digest(seq, &out[HEADER_LEN..at]);
+        let digest = digest(MAGIC, seq, &out[HEADER_LEN..at]);
         let tag = cipher.encrypt(&nonce(&digest), digest.as_bytes(), &mut [])?;
         out[..8].copy_from_slice(MAGIC);
         out[8..16].copy_from_slice(&seq.to_le_bytes());
@@ -87,9 +108,10 @@ impl Store {
         Ok(at)
     }
 
-    /// An image's `seq`, if `bytes` starts like one. Says nothing about whether it verifies.
+    /// An image's `seq`, if `bytes` starts like one, of either version. Says nothing about whether it verifies.
     pub fn image_seq(bytes: &[u8]) -> Option<u64> {
-        (bytes.get(..8)? == MAGIC).then(|| u64::from_le_bytes(bytes[8..16].try_into().unwrap()))
+        let magic = bytes.get(..8)?;
+        (magic == MAGIC || magic == MAGIC_V1).then(|| u64::from_le_bytes(bytes[8..16].try_into().unwrap()))
     }
 
     /// A store from an image [`Store::save_image`] wrote, and its `seq`, only if its digest and seal verify through `cipher`
@@ -98,7 +120,8 @@ impl Store {
         let seq = Self::image_seq(bytes).ok_or(StoreError::ImageInvalid)?;
         let body_len = u32::from_le_bytes(bytes[16..20].try_into().unwrap()) as usize;
         let body = bytes.get(HEADER_LEN..HEADER_LEN.checked_add(body_len).ok_or(StoreError::ImageInvalid)?).ok_or(StoreError::ImageInvalid)?;
-        let computed = digest(seq, body);
+        let v1 = bytes[..8] == *MAGIC_V1;
+        let computed = digest(if v1 { MAGIC_V1 } else { MAGIC }, seq, body);
         let mut stored = [0u8; hash::HASH_LEN];
         stored.copy_from_slice(&bytes[20..52]);
         if !computed.ct_eq(&hash::Hash::from_bytes(stored)) {
@@ -111,7 +134,16 @@ impl Store {
         // Authentic: only the key's holder made it. Still checked, so a bug in a writer can't become a bad state here.
         let mut store = Store::new(self_cnode_cptr);
         let bad = StoreError::ImageInvalid;
-        let (files, blocks) = body.split_at_checked(MAX_FILES * FILE_LEN).ok_or(bad)?;
+        let body = if v1 {
+            body
+        } else {
+            let (counts, rest) = body.split_at_checked(COUNTS_LEN).ok_or(bad)?;
+            store.writes = u64::from_le_bytes(counts[..8].try_into().unwrap());
+            store.boots = u32::from_le_bytes(counts[8..12].try_into().unwrap());
+            rest
+        };
+        let file_len = if v1 { FILE_LEN_V1 } else { FILE_LEN };
+        let (files, blocks) = body.split_at_checked(MAX_FILES * file_len).ok_or(bad)?;
         let mut at = 0;
         for slot in store.blocks.iter_mut() {
             match blocks.get(at).ok_or(bad)? {
@@ -139,7 +171,7 @@ impl Store {
             return Err(bad);
         }
         let mut counted = [0u32; MAX_BLOCKS];
-        for (slot, record) in store.files.iter_mut().zip(files.chunks_exact(FILE_LEN)) {
+        for (slot, record) in store.files.iter_mut().zip(files.chunks_exact(file_len)) {
             let block = match record[1] {
                 NO_BLOCK => None,
                 b if (b as usize) < MAX_BLOCKS && store.blocks[b as usize].is_some() => {
@@ -148,10 +180,25 @@ impl Store {
                 }
                 _ => return Err(bad),
             };
+            let mut history = [None; provenance::ENTRIES];
+            if !v1 {
+                let count = record[2] as usize;
+                if count > provenance::ENTRIES {
+                    return Err(bad);
+                }
+                for (i, e) in history.iter_mut().enumerate().take(count) {
+                    let at = 3 + i * ENTRY_LEN;
+                    *e = Some(Entry {
+                        principal: u64::from_le_bytes(record[at..at + 8].try_into().unwrap()),
+                        write: u64::from_le_bytes(record[at + 8..at + 16].try_into().unwrap()),
+                        boot: u32::from_le_bytes(record[at + 16..at + 20].try_into().unwrap()),
+                    });
+                }
+            }
             *slot = match record[0] {
-                NO_FILE if block.is_none() => None,
-                LIVE => Some(FileRecord { block, destroyed: false }),
-                DESTROYED => Some(FileRecord { block, destroyed: true }),
+                NO_FILE if block.is_none() && history[0].is_none() => None,
+                LIVE => Some(FileRecord { block, destroyed: false, history }),
+                DESTROYED => Some(FileRecord { block, destroyed: true, history }),
                 _ => return Err(bad),
             };
         }
@@ -257,5 +304,67 @@ mod tests {
         let mut image = std::vec![0u8; IMAGE_MAX];
         let len = bad.save_image(&mut c, 1, &mut image).unwrap();
         assert_eq!(Store::load_image(0, &mut c, &image[..len]).err(), Some(StoreError::ImageInvalid));
+    }
+
+    #[test]
+    fn history_and_counts_survive_an_image() {
+        let mut c = cipher(3);
+        let mut saved = store(&mut c, b"x");
+        saved.writes = 9;
+        saved.boots = 3;
+        let entry = Entry { principal: 0xabc, write: 9, boot: 3 };
+        saved.files[0].as_mut().unwrap().history[0] = Some(entry);
+        let mut image = std::vec![0u8; IMAGE_MAX];
+        let len = saved.save_image(&mut c, 2, &mut image).unwrap();
+        let (loaded, _) = Store::load_image(0, &mut c, &image[..len]).unwrap();
+        assert_eq!((loaded.writes, loaded.boots), (9, 3));
+        assert_eq!(loaded.file_entry(0, 0), Some(entry));
+        assert_eq!(loaded.file_entry(0, 1), None);
+    }
+
+    /// A store as an `LSTORE01` image, laid out as RFC-0031 wrote them.
+    fn save_v1(store: &Store, cipher: &mut TestCipher, seq: u64) -> std::vec::Vec<u8> {
+        let mut body = std::vec::Vec::new();
+        for file in &store.files {
+            match file {
+                None => body.extend_from_slice(&[NO_FILE, NO_BLOCK]),
+                Some(f) => body.extend_from_slice(&[if f.destroyed { DESTROYED } else { LIVE }, f.block.map_or(NO_BLOCK, |b| b as u8)]),
+            }
+        }
+        for block in &store.blocks {
+            match block {
+                None => body.push(0),
+                Some(b) => {
+                    body.push(1);
+                    body.extend_from_slice(b.hash.as_bytes());
+                    body.extend_from_slice(&(b.len as u16).to_le_bytes());
+                    body.extend_from_slice(&b.refcount.to_le_bytes());
+                    body.extend_from_slice(&b.tag);
+                    body.extend_from_slice(&b.ciphertext[..b.len]);
+                }
+            }
+        }
+        let digest = digest(MAGIC_V1, seq, &body);
+        let tag = cipher.encrypt(&nonce(&digest), digest.as_bytes(), &mut []).unwrap();
+        let mut out = std::vec::Vec::new();
+        out.extend_from_slice(MAGIC_V1);
+        out.extend_from_slice(&seq.to_le_bytes());
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(digest.as_bytes());
+        out.extend_from_slice(&tag);
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[test]
+    fn an_image_from_before_provenance_still_loads_with_no_history() {
+        let mut c = cipher(3);
+        let image = save_v1(&store(&mut c, b"from before"), &mut c, 4);
+        assert_eq!(Store::image_seq(&image), Some(4));
+        let (loaded, seq) = Store::load_image(0, &mut c, &image).unwrap();
+        assert_eq!(seq, 4);
+        assert_eq!(plaintext(&loaded, &mut c, 0), b"from before");
+        assert_eq!(loaded.file_info(0).unwrap().entries, 0);
+        assert_eq!((loaded.writes, loaded.boots), (0, 0));
     }
 }

@@ -125,6 +125,13 @@
   `load_image` refuses anything that doesn't verify, or isn't consistent, as `ImageInvalid`. 4 tests: a round trip, any
   changed byte or a torn image, another key, and an authentic but inconsistent image. **Rollback isn't prevented**:
   RFC-0023's checklist. 25 tests.
+- **Provenance (2026-11-15, [RFC-0033](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0033-provenance-for-data-at-rest.md)/[ADR-0038](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0038-provenance-for-data-at-rest.md)).** Each write records `{principal, write, boot}`, the principal coming from the
+  binder's grant (`request_file_access_for`). Each file keeps its last 4 writes, newest first. Image format `LSTORE02`
+  holds the counts and entries, and `LSTORE01` still loads. `file_info` and `file_entry` give sizes and entries, never
+  contents. 28 tests.
+- **A person's own files (2026-11-16, [RFC-0034](https://github.com/lantern-os/lantern-rfcs/blob/main/rfcs/0034-local-inference-and-a-file-assistant.md)/[ADR-0039](https://github.com/lantern-os/lantern-rfcs/blob/main/adr/0039-local-inference-and-a-file-assistant.md)).** `write_from_console` and `read_from_console` serve the shell's `write`
+  and `read` with no grant, the write recorded as `provenance::CONSOLE`; `ensure_files` gives an older image the files the
+  policy now names (1 and 2, the file assistant's). 29 tests.
 ## Next
 - Multi-block chunking for content larger than `MAX_BLOCK_LEN` — `ARCHITECTURE.md`'s
   "efficient large-file... patterns over CAS" open question.
